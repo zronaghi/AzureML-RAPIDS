@@ -39,10 +39,19 @@ def main():
     t2 = time.time()
     print('\n---->>>> cuDF time: {:.2f} <<<<----\n'.format(t2-t1))
 
-    X = df[df.columns.difference(['ArrDelay', 'ArrDelayBinary'])]
-    y = df['ArrDelayBinary'].astype(np.int32)
+    try:
+        X = df[df.columns.difference(['ArrDelay', 'ArrDelayBinary'])]
+        y = df['ArrDelayBinary'].astype(np.int32)
+    except:
+        df["ArrDelayBinary"] = 1.0 * (
+            df["ArrDelay"] > 10
+        )
+        X = df[df.columns.difference(['ArrDelay', 'ArrDelayBinary'])]
+        y = df['ArrDelayBinary'].astype(np.int32)
     del df
-    
+    for col in X.columns:
+        X[col] = X[col].astype(np.float32)  # needed for random forest
+
     n_estimators = args.n_estimators
     run.log('n_estimators', np.int(args.n_estimators))
     max_depth = args.max_depth
