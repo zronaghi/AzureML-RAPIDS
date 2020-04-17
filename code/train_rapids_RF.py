@@ -12,12 +12,11 @@ from cuml import RandomForestClassifier as cuRF
 from cuml.preprocessing.model_selection import train_test_split
 from cuml.metrics.accuracy import accuracy_score
 
+from rapids_csp_azure import RapidsCloudML, PerfTimer
 from azureml.core.run import Run
 run = Run.get_context()
 
 def main():
-    start_script = time.time()
-    
     parser = argparse.ArgumentParser()
 
     parser.add_argument('--data_dir', type=str, help='location of data')
@@ -26,31 +25,8 @@ def main():
     parser.add_argument('--n_bins', type=int, default=8, help='Number of bins used in split point calculation')
     parser.add_argument('--max_features', type=float, default=1.0, help='Number of features for best split')
 
-
     args = parser.parse_args()
     data_dir = args.data_dir
-    
-    print('\n---->>>> cuDF version <<<<----\n', cudf.__version__)
-    print('\n---->>>> cuML version <<<<----\n', cuml.__version__)
-    
-    t1 = time.time()
-    df = cudf.read_parquet(os.path.join(data_dir, 'airline_20m.parquet'))
-#     df = cudf.read_orc(os.path.join(data_dir, 'airline_20000000.orc'))
-    t2 = time.time()
-    print('\n---->>>> cuDF time: {:.2f} <<<<----\n'.format(t2-t1))
-
-    try:
-        X = df[df.columns.difference(['ArrDelay', 'ArrDelayBinary'])]
-        y = df['ArrDelayBinary'].astype(np.int32)
-    except:
-        df["ArrDelayBinary"] = 1.0 * (
-            df["ArrDelay"] > 10
-        )
-        X = df[df.columns.difference(['ArrDelay', 'ArrDelayBinary'])]
-        y = df['ArrDelayBinary'].astype(np.int32)
-    del df
-    for col in X.columns:
-        X[col] = X[col].astype(np.float32)  # needed for random forest
 
     n_estimators = args.n_estimators
     run.log('n_estimators', np.int(args.n_estimators))
@@ -60,46 +36,59 @@ def main():
     run.log('n_bins', np.int(args.n_bins))
     max_features = args.max_features
     run.log('max_features', np.str(args.max_features))
-        
+
+    print('\n---->>>> cuDF version <<<<----\n', cudf.__version__)
+    print('\n---->>>> cuML version <<<<----\n', cuml.__version__)
+
+    azure_ml = RapidsCloudML(cloud_type= 'Azure', data_type="Parquet")
+
+    dataset, _ , y_label, _ = azure_ml.load_data(filename=os.path.join(data_dir, 'airline_20m.parquet'))
+
+    X = dataset[dataset.columns.difference(['ArrDelay', y_label])]
+    y = dataset[y_label]
+    del dataset
+
     print('\n---->>>> Training using GPUs <<<<----\n')
-    
+
     # ----------------------------------------------------------------------------------------------------
     # cross-validation folds 
     # ----------------------------------------------------------------------------------------------------
-    accuracy_per_fold = []; train_time_per_fold = []; infer_time_per_fold = []; trained_model = [];
-    global_best_model = None; global_best_test_accuracy = 0
-    
-    traintime = time.time()
+    accuracy_per_fold = []
+    train_time_per_fold = []
+    infer_time_per_fold = []
+    trained_model = []
+    global_best_test_accuracy = 0
+
+    model_params = {
+        'n_estimators' : n_estimators,
+        'max_depth' : max_depth,
+        'max_features': max_features,
+        'n_bins' : n_bins,
+        'CV_FOLDS': 5
+    }
+
+    # traintime = time.time()
     # optional cross-validation w/ model_params['n_train_folds'] > 1
     for i_train_fold in range(5):
         print( f"\n CV fold { i_train_fold } of { 5 }\n" )
 
         # split data
-        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=i_train_fold, shuffle = True)
-
+        X_train, X_test, y_train, y_test, _ = azure_ml.split_data(X, y, random_state =77, shuffle = True )
         # train model 
-        cu_rf = cuRF(n_estimators=n_estimators, max_depth=max_depth, n_bins=n_bins, max_features=max_features)
-        start1 = time.time()
-        trained_model = cu_rf.fit(X_train, y_train)
-        training_time = time.time() - start1
+        trained_model, training_time = azure_ml.train_model (X_train, y_train, model_params)
+
         train_time_per_fold += [ round( training_time, 4) ]
 
         # evaluate perf
-        start2 = time.time()
-        cuml_pred = cu_rf.predict(X_test)
-        infer_time = time.time() - start2
-
-        cuml_accuracy = accuracy_score(cuml_pred, y_test) * 100
-                
-        accuracy_per_fold += [ round( cuml_accuracy, 4) ]
+        test_accuracy, infer_time = azure_ml.evaluate_test_perf (trained_model, X_test, y_test)
+        accuracy_per_fold += [ round( test_accuracy, 4) ]
         infer_time_per_fold += [ round( infer_time, 4) ]
 
         # update best model [ assumes maximization of perf metric ]
-        if cuml_accuracy > global_best_test_accuracy :
-            global_best_test_accuracy = cuml_accuracy
-    
-    total_train_inference_time = time.time() - traintime
-    run.log('Total training inference time', np.float(total_train_inference_time))
+        if test_accuracy > global_best_test_accuracy :
+            global_best_test_accuracy = test_accuracy
+
+    run.log('Total training inference time', np.float(training_time + infer_time))
     run.log('Accuracy', np.float(global_best_test_accuracy))
     print( '\n Accuracy             :', global_best_test_accuracy)
     print( '\n accuracy per fold    :', accuracy_per_fold)
@@ -107,13 +96,11 @@ def main():
     print( '\n train-time all folds  :', sum(train_time_per_fold))
     print( '\n infer-time per fold  :', infer_time_per_fold)
     print( '\n infer-time all folds  :', sum(infer_time_per_fold))
-              
-    end_script = time.time()
-    print('Total runtime: {:.2f}'.format(end_script-start_script))
-    run.log('Total runtime', np.float(end_script-start_script))
-    
-    print('\n Exiting script')
-    
+
 
 if __name__ == '__main__':
-    main()
+    with PerfTimer() as total_script_time:
+        main()
+    print('Total runtime: {:.2f}'.format(total_script_time.duration))
+    run.log('Total runtime', np.float(total_script_time.duration))
+    print('\n Exiting script')

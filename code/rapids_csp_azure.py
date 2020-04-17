@@ -46,7 +46,7 @@ CV_FOLDS = 5
 class RapidsCloudML ( object ):
 
     def __init__ ( self, cloud_type = 'Azure', 
-                   model_type = 'RF', 
+                   model_type = 'RandomForest', 
                    data_type = 'Parquet',
                    compute_type = 'single-GPU', 
 #                    n_workers = -1, 
@@ -60,7 +60,7 @@ class RapidsCloudML ( object ):
         self.compute_type = compute_type
         self.verbose_estimator = verbose_estimator
 #         self.n_workers = self.parse_compute( n_workers )
-        self.query_memory()
+        # self.query_memory()
 
     def load_hyperparams( self, model_name = 'XGBoost', CV_folds = CV_FOLDS ):
             self.log_to_file('\n> loading hyperparameters \n')
@@ -107,10 +107,12 @@ class RapidsCloudML ( object ):
                 
     def load_data( self, filename = 'dataset.orc', col_labels = None, y_label = 'ArrDelayBinary'):                
         
-#         target_filename = self.CSP_paths['train_data'] + '/' + filename
+        # df = cudf.read_parquet(os.path.join(data_dir, 'airline_20m.parquet')) # RETRIEVE FILENAME
+
         target_filename = filename
+
         self.log_to_file( f'\n> loading dataset from {target_filename}...\n')
-                
+
         with PerfTimer() as ingestion_timer:
             if 'CPU' in self.compute_type:            
                 if 'ORC' in self.data_type:
@@ -123,7 +125,19 @@ class RapidsCloudML ( object ):
                     dataset = cudf.read_orc( target_filename )
                 elif 'CSV' in self.data_type:
                     dataset = cudf.read_csv( target_filename, names = col_labels )
+                elif 'Parquet' in self.data_type:
+                    dataset = cudf.read_parquet(target_filename)
 
+        for col in dataset.columns:
+            dataset[col] = dataset[col].astype(np.float32)  # needed for random forest
+        
+        # Adding y_label column if it is not present
+        if y_label not in dataset.columns:
+            dataset[y_label] = 1.0 * (
+                    dataset["ArrDelay"] > 10
+                )
+            dataset[y_label] = dataset[y_label].astype(np.int32)
+        
         self.log_to_file( f'ingestion completed in {ingestion_timer.duration}')        
         self.log_to_file(f'dataset descriptors: {dataset.shape}\n {dataset.dtypes}\n {dataset.columns}\n')        
         return dataset, col_labels, y_label, ingestion_timer.duration
@@ -149,11 +163,13 @@ class RapidsCloudML ( object ):
         return X_train, X_test, y_train, y_test, split_timer.duration
 
     def train_model ( self, X_train, y_train, model_params ):
-        self.log_to_file(f'\training {self.model_type} estimator w/ hyper-params')        
+        self.log_to_file(f'\training {self.model_type} estimator w/ hyper-params') 
+        training_time = 0       
         try:            
             if self.model_type == 'XGBoost':
                 trained_model, training_time = self.fit_xgboost ( X_train, y_train, model_params )
             elif self.model_type == 'RandomForest':
+                print("HERE")
                 trained_model, training_time = self.fit_random_forest ( X_train, y_train, model_params )
         except Exception as error:
             self.log_to_file( '!error during model training: ' + str(error) )
